@@ -13,14 +13,20 @@ namespace DnsWatcher
 {
     public class Query
     {
-        public readonly QueryWatcher QueryWatcher;
-        public readonly DnsQuestion Question;
-        public bool OriginServer = false;
-        public bool ReportErrors = false;
+        public QueryWatcher QueryWatcher { get; }
+        public DnsQuestion Question { get; }
+        public bool OriginServer { get; set; } = false;
+        /// <summary>
+        /// TTL is adjusted continuously by any DNS cache. You should directly access the origin server if watching the TTL.
+        /// </summary>
+        public bool WatchTtl { get; set; } = false;
+        public bool ReportErrors { get; set; } = false;
         private string? lastValue = null;
 
-        public delegate void ChangedEventHandler(Query sender, IDnsQueryResponse e);
-        public event ChangedEventHandler? Change = null;
+        public Func<Query, Dictionary<string, HashSet<IPAddress>>, Task>? FilterOriginServers = null;
+
+        public delegate void ChangeEventHandler(Query sender, IDnsQueryResponse e);
+        public event ChangeEventHandler? Change = null;
 
         internal Query(QueryWatcher watcher, DnsQuestion question)
         {
@@ -28,9 +34,15 @@ namespace DnsWatcher
             Question = question;
         }
 
-        public Query SetOriginServer(bool originServer = true)
+        public Query SetOriginServer(bool originServer = true, Func<Query, Dictionary<string, HashSet<IPAddress>>, Task>? filterOriginServers = null)
         {
             OriginServer = originServer;
+            FilterOriginServers = filterOriginServers;
+            return this;
+        }
+        public Query SetWatchTtl(bool watchTtl = true)
+        {
+            WatchTtl = watchTtl;
             return this;
         }
         public Query SetReportErrors(bool reportErrors = true)
@@ -38,7 +50,7 @@ namespace DnsWatcher
             ReportErrors = reportErrors;
             return this;
         }
-        public Query OnChange(ChangedEventHandler action)
+        public Query OnChange(ChangeEventHandler action)
         {
             Change += action;
             return this;
@@ -80,26 +92,33 @@ namespace DnsWatcher
                 bool ipv6 = IPv6Routable();
                 //Get domain names for actual nameservers...
                 var resultNs = await dns.QueryAsync(Question.QueryName, QueryType.NS, Question.QuestionClass, cancellationToken).ConfigureAwait(false);
-                var nameservers = new Dictionary<string, int>();
-                var nameserverIps = new HashSet<IPAddress>();
+                var nameservers = new Dictionary<string, HashSet<IPAddress>>();
                 foreach (var ns in resultNs.Answers.NsRecords())
                 {
-                    nameservers[ns.NSDName] = 0;
+                    nameservers.Add(ns.NSDName, new HashSet<IPAddress>());
                 }
-                foreach (var glue in resultNs.AllRecords.AddressRecords())
+                //Include glue records... (if any)
+                void MergeIps(IDnsQueryResponse response)
                 {
-                    if (nameservers.TryGetValue(glue.DomainName, out var i))
+                    foreach (var addr in response.AllRecords.AddressRecords())
                     {
-                        nameserverIps.Add(glue.Address);
-                        //Record address family...
-                        nameservers[glue.DomainName] = i | AddressFamilyMask(glue.Address.AddressFamily);
+                        if (nameservers.TryGetValue(addr.DomainName, out var ips))
+                        {
+                            ips.Add(addr.Address);
+                        }
                     }
                 }
-                //Get IPs for actual nameservers... (if glue not present)
+                MergeIps(resultNs);
+                //Let the user filter the nameservers...
+                if (FilterOriginServers != null)
+                {
+                    await FilterOriginServers(this, nameservers);
+                }
+                //Get IPs for nameservers... (if glue not present)
                 var queries = new List<Task<IDnsQueryResponse>>();
                 foreach (var kv in nameservers)
                 {
-                    if (kv.Value == 0 || (!ipv6 && kv.Value == AddressFamilyMask(AddressFamily.InterNetworkV6)))
+                    if ((ipv6 ? kv.Value.Count : kv.Value.Count(ip => ip.AddressFamily != AddressFamily.InterNetworkV6)) == 0)
                     {
                         queries.Add(dns.QueryAsync(kv.Key, QueryType.A, QueryClass.IN, cancellationToken));
                         if (ipv6)
@@ -110,13 +129,13 @@ namespace DnsWatcher
                 }
                 foreach (var response in await Task.WhenAll(queries).ConfigureAwait(false))
                 {
-                    foreach (var addr in response.Answers.AddressRecords())
-                    {
-                        if (nameservers.TryGetValue(addr.DomainName, out var i))
-                        {
-                            nameserverIps.Add(addr.Address);
-                        }
-                    }
+                    MergeIps(response);
+                }
+                //Combine list of nameserver IPs...
+                var nameserverIps = new HashSet<IPAddress>();
+                foreach (var kv in nameservers)
+                {
+                    nameserverIps.UnionWith(kv.Value);
                 }
                 //Rebuild options with actual nameservers...
                 options = new DnsQueryAndServerOptions((ipv6 ? nameserverIps : nameserverIps.Where(ip => ip.AddressFamily != AddressFamily.InterNetworkV6)).ToArray())
@@ -162,12 +181,20 @@ namespace DnsWatcher
                 var sb = new StringBuilder();
                 foreach (var t in text)
                 {
-                    var i = t.IndexOf(' ');
-                    i++;
-                    var j = t.IndexOf(' ', i);
-                    sb.Append(t, 0, i);
-                    sb.Append("00");
-                    sb.Append(t.AsSpan()[j..]);
+                    if (WatchTtl)
+                    {
+                        sb.Append(t);
+                    }
+                    else
+                    {
+                        var i = t.IndexOf(' ');
+                        i++;
+                        var j = t.IndexOf(' ', i);
+                        sb.Append(t, 0, i);
+                        sb.Append("00");
+                        sb.Append(t.AsSpan()[j..]);
+                    }
+                    sb.AppendLine();
                 }
                 //Compare with previous value...
                 var value = sb.ToString();
