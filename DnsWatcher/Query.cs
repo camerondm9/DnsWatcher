@@ -112,7 +112,14 @@ namespace DnsWatcher
                 //Let the user filter the nameservers...
                 if (FilterOriginServers != null)
                 {
-                    await FilterOriginServers(this, nameservers);
+                    try
+                    {
+                        await FilterOriginServers(this, nameservers);
+                    }
+                    catch (Exception ex)
+                    {
+                        System.Diagnostics.Trace.TraceError(ex.ToString());
+                    }
                 }
                 //Get IPs for nameservers... (if glue not present)
                 var queries = new List<Task<IDnsQueryResponse>>();
