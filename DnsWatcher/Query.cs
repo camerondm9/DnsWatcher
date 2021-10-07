@@ -15,15 +15,15 @@ namespace DnsWatcher
     {
         public QueryWatcher QueryWatcher { get; }
         public DnsQuestion Question { get; }
-        public bool OriginServer { get; set; } = false;
+        public bool AuthoritativeServers { get; set; } = false;
         /// <summary>
-        /// TTL is adjusted continuously by any DNS cache. You should directly access the origin server if watching the TTL.
+        /// TTL is adjusted continuously by any DNS cache. You should directly access the authoritative server if watching the TTL.
         /// </summary>
         public bool WatchTtl { get; set; } = false;
-        public bool ReportErrors { get; set; } = false;
+        public bool SuppressErrors { get; set; } = false;
         private string? lastValue = null;
 
-        public Func<Query, Dictionary<string, HashSet<IPAddress>>, Task>? FilterOriginServers = null;
+        public Func<Query, Dictionary<string, HashSet<IPAddress>>, CancellationToken, Task>? FilterAuthoritativeServers = null;
 
         public delegate void ChangeEventHandler(Query sender, IDnsQueryResponse e);
         public event ChangeEventHandler? Change = null;
@@ -34,20 +34,23 @@ namespace DnsWatcher
             Question = question;
         }
 
-        public Query SetOriginServer(bool originServer = true, Func<Query, Dictionary<string, HashSet<IPAddress>>, Task>? filterOriginServers = null)
+        public Query SetAuthoritativeServers(bool authoritativeServers = true, Func<Query, Dictionary<string, HashSet<IPAddress>>, CancellationToken, Task>? filterAuthoritativeServers = null)
         {
-            OriginServer = originServer;
-            FilterOriginServers = filterOriginServers;
+            AuthoritativeServers = authoritativeServers;
+            FilterAuthoritativeServers = filterAuthoritativeServers;
             return this;
         }
+        /// <summary>
+        /// TTL is adjusted continuously by any DNS cache. You should directly access the authoritative server if watching the TTL.
+        /// </summary>
         public Query SetWatchTtl(bool watchTtl = true)
         {
             WatchTtl = watchTtl;
             return this;
         }
-        public Query SetReportErrors(bool reportErrors = true)
+        public Query SetSuppressErrors(bool suppressErrors = true)
         {
-            ReportErrors = reportErrors;
+            SuppressErrors = suppressErrors;
             return this;
         }
         public Query OnChange(ChangeEventHandler action)
@@ -68,25 +71,10 @@ namespace DnsWatcher
             return false;
         }
 
-        private static int AddressFamilyMask(AddressFamily family)
-        {
-            switch (family)
-            {
-                case AddressFamily.InterNetwork:
-                default:
-                    return 2;
-                case AddressFamily.InterNetworkV6:
-                    return 1;
-                case AddressFamily.Unknown:
-                case AddressFamily.Unspecified:
-                    return 0;
-            }
-        }
-
         public async Task<int> Update(LookupClient dns, CancellationToken cancellationToken)
         {
             DnsQueryAndServerOptions? options = null;
-            if (OriginServer)
+            if (AuthoritativeServers)
             {
                 //Check for IPv6 support...
                 bool ipv6 = IPv6Routable();
@@ -96,6 +84,10 @@ namespace DnsWatcher
                 foreach (var ns in resultNs.Answers.NsRecords())
                 {
                     nameservers.Add(ns.NSDName, new HashSet<IPAddress>());
+                }
+                if (nameservers.Count == 0)
+                {
+                    throw new InvalidOperationException("No nameservers found!");
                 }
                 //Include glue records... (if any)
                 void MergeIps(IDnsQueryResponse response)
@@ -110,15 +102,20 @@ namespace DnsWatcher
                 }
                 MergeIps(resultNs);
                 //Let the user filter the nameservers...
-                if (FilterOriginServers != null)
+                if (FilterAuthoritativeServers != null)
                 {
                     try
                     {
-                        await FilterOriginServers(this, nameservers);
+                        await FilterAuthoritativeServers(this, nameservers, cancellationToken).ConfigureAwait(false);
                     }
                     catch (Exception ex)
                     {
                         System.Diagnostics.Trace.TraceError(ex.ToString());
+                    }
+                    if (nameservers.Count == 0)
+                    {
+                        //All nameservers removed, cancel this query...
+                        return int.MaxValue;
                     }
                 }
                 //Get IPs for nameservers... (if glue not present)
@@ -143,6 +140,10 @@ namespace DnsWatcher
                 foreach (var kv in nameservers)
                 {
                     nameserverIps.UnionWith(kv.Value);
+                }
+                if (nameserverIps.Count == 0)
+                {
+                    throw new InvalidOperationException("No nameservers resolved!");
                 }
                 //Rebuild options with actual nameservers...
                 options = new DnsQueryAndServerOptions((ipv6 ? nameserverIps : nameserverIps.Where(ip => ip.AddressFamily != AddressFamily.InterNetworkV6)).ToArray())
@@ -208,26 +209,25 @@ namespace DnsWatcher
                 if (lastValue != value)
                 {
                     lastValue = value;
-                }
-                else
-                {
-                    //Intentionally skips invoking the Change event
-                    return minTtl;
+                    OnChange(result);
                 }
             }
-            else if (!ReportErrors)
+            else if (!SuppressErrors)
             {
-                return minTtl;
+                OnChange(result);
             }
+            return minTtl;
+        }
+        private void OnChange(IDnsQueryResponse response)
+        {
             try
             {
-                Change?.Invoke(this, result);
+                Change?.Invoke(this, response);
             }
             catch (Exception ex)
             {
                 System.Diagnostics.Trace.TraceError(ex.ToString());
             }
-            return minTtl;
         }
         private static bool Match(ResourceRecordType rType, QueryType qType)
         {

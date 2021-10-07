@@ -107,56 +107,63 @@ namespace DnsWatcher
         {
             while (!token.IsCancellationRequested)
             {
-                //Use new LookupClient to get up-to-date DNS settings...
-                var dns = new LookupClient(DnsLookupOptions);
-                //Prepare queries...
                 int minTtl = int.MaxValue;
-                if (dns.NameServers.Count > 0)
+                try
                 {
-                    List<Task<int>> tasks;
-                    lock (queries)
+                    //Use new LookupClient to get up-to-date DNS settings...
+                    var dns = new LookupClient(DnsLookupOptions);
+                    //Prepare queries...
+                    if (dns.NameServers.Count > 0)
                     {
-                        tasks = new(queries.Count);
-                        foreach (var q in queries)
+                        List<Task<int>> tasks;
+                        lock (queries)
                         {
-                            tasks.Add(q.Update(dns, token));
+                            tasks = new(queries.Count);
+                            foreach (var q in queries)
+                            {
+                                tasks.Add(q.Update(dns, token));
+                            }
+                        }
+                        //Run all queries and determine shortest TTL...
+                        foreach (var ttl in await Task.WhenAll(tasks).ConfigureAwait(false))
+                        {
+                            if (minTtl > ttl)
+                            {
+                                minTtl = ttl;
+                            }
                         }
                     }
-                    //Run all queries and determine shortest TTL...
-                    foreach (var ttl in await Task.WhenAll(tasks).ConfigureAwait(false))
+                    if (minTtl == int.MaxValue)
                     {
-                        if (minTtl > ttl)
+                        //No records found, or all errors...
+                        minTtl = (int)DnsLookupOptions.FailedResultsCacheDuration.TotalMilliseconds;
+                    }
+                    else
+                    {
+                        //DNS TTL is in seconds, but we need milliseconds...
+                        minTtl *= 1000;
+                    }
+                    //Constrain refresh timeout...
+                    if (DnsLookupOptions.MinimumCacheTimeout.HasValue)
+                    {
+                        var minTimeout = (int)DnsLookupOptions.MinimumCacheTimeout.Value.TotalMilliseconds;
+                        if (minTtl < minTimeout)
                         {
-                            minTtl = ttl;
+                            minTtl = minTimeout;
+                        }
+                    }
+                    if (DnsLookupOptions.MaximumCacheTimeout.HasValue)
+                    {
+                        var maxTimeout = (int)DnsLookupOptions.MaximumCacheTimeout.Value.TotalMilliseconds;
+                        if (minTtl > maxTimeout)
+                        {
+                            minTtl = maxTimeout;
                         }
                     }
                 }
-                if (minTtl == int.MaxValue)
+                catch (Exception ex) when (ex is not OperationCanceledException)
                 {
-                    //No records found, or all errors...
-                    minTtl = (int)DnsLookupOptions.FailedResultsCacheDuration.TotalMilliseconds;
-                }
-                else
-                {
-                    //DNS TTL is in seconds, but we need milliseconds...
-                    minTtl *= 1000;
-                }
-                //Constrain refresh timeout...
-                if (DnsLookupOptions.MinimumCacheTimeout.HasValue)
-                {
-                    var minTimeout = (int)DnsLookupOptions.MinimumCacheTimeout.Value.TotalMilliseconds;
-                    if (minTtl < minTimeout)
-                    {
-                        minTtl = minTimeout;
-                    }
-                }
-                if (DnsLookupOptions.MaximumCacheTimeout.HasValue)
-                {
-                    var maxTimeout = (int)DnsLookupOptions.MaximumCacheTimeout.Value.TotalMilliseconds;
-                    if (minTtl > maxTimeout)
-                    {
-                        minTtl = maxTimeout;
-                    }
+                    System.Diagnostics.Trace.TraceError(ex.ToString());
                 }
                 //Wait for network connectivity changes or a refresh timeout...
                 await networkChange.WaitAsync(minTtl, token).ConfigureAwait(false);
