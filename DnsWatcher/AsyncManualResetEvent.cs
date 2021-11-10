@@ -24,6 +24,8 @@ namespace DnsWatcher
         }
         public async Task<bool> WaitAsync(int millisecondsTimeout, CancellationToken cancellationToken = default)
         {
+            //TODO: The new (.Net 6) Task.WaitAsync method might be a better option here...
+
             // Modified from SemaphoreSlim.WaitUntilCountOrTimeoutAsync
             // https://referencesource.microsoft.com/#mscorlib/system/threading/SemaphoreSlim.cs,c44be0c6552c5861
             var task = m_tcs.Task;
